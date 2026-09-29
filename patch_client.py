@@ -7,7 +7,8 @@ import os, pathlib, sys
 # Where your pristine copy of the 2012 release lives. Override with BUILDO_SRC.
 SRC_DIR = pathlib.Path(os.environ.get(
     "BUILDO_SRC", pathlib.Path.home()/"Downloads"/"OldAssBuildoWinFrom2012"))
-OUT     = [SRC_DIR/"Buildo-local.exe", pathlib.Path.home()/"buildo-run"/"Buildo-local.exe"]
+OUT_DIR = pathlib.Path(os.environ.get("BUILDO_OUT", pathlib.Path.home()/"buildo-run"))
+OUT     = [OUT_DIR/"Buildo-local.exe"]
 HTTP_PORT = 8081          # >1024 so the responder needs no root
 
 d = bytearray((SRC_DIR/"Buildo.exe").read_bytes())

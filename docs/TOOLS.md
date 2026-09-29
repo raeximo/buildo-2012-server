@@ -95,6 +95,7 @@ set them to the honest value if you want only what is provably original (see
 | variable | default | what it does |
 |---|---|---|
 | `BUILDO_WORLDS` | `START\nSECOND\nTHIRD` | newline-separated world list the menu offers |
+| `BUILDO_WORLD_DIR` | `worlds` | directory for persistent world saves; loaded on first entry and saved every 5 seconds plus clean shutdown |
 | `BUILDO_WORLD_VER` | `2` | world blob version byte |
 | `BUILDO_FEAT` | `ds` | which special tiles a fresh world gets: `d` door, `s` sign, `l` lock, `p` seed, `b` boombox, `r` Olde Timey Radio, `w` a run of wood platforms |
 | `BUILDO_NO_DOOR` | unset | equivalent to `BUILDO_FEAT=` |
@@ -110,6 +111,7 @@ set them to the honest value if you want only what is provably original (see
 
 | variable | default | what it does |
 |---|---|---|
+| `BUILDO_PLAYER_DIR` | `players` | directory for persistent clothing and skin profiles, keyed by player name |
 | `BUILDO_INV` | starter kit | inventory as `id:count,id:count,…` |
 | `BUILDO_WEAR` | — | worn items as `id,id,…` |
 | `BUILDO_GEM_CHANCE` | `50` | percent chance a broken block drops gems — **ours**; `0` turns gem drops off |

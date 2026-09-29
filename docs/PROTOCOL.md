@@ -402,8 +402,10 @@ World::ApplyPacket 0x43F270 is what both edit packets go through:
                     material 12 writes the background
                     material 13 plants a seed, only on an empty tile
                     anything else writes the foreground
-                    then flags 0x08/0x10 from count1, and 0x20 from
-                    packet flags bit 0x10
+                    then flags 0x08/0x10 from count1, and tile mirror flag
+                    0x20 from packet flags bit 0x10. The placement builder
+                    copies the avatar's facing byte into that packet bit;
+                    the tile renderer mirrors materials 4, 5 and 6 with it.
     packetType 8 -> Tile::Damage(intData)                        0x43E4A0
                     damage = min(damage + n, ItemInfo.hp)
                     tile+0x2c = now_ms + ItemInfo.healSecs*1000
@@ -572,4 +574,3 @@ it doesn't exist"*. `BUILDO_TEST_ACTION="/dance"` fires one at the player and
 re-arms it on every tile click, because synthetic keystrokes do not reach the
 client's chat box and an emote fired at world entry is over before a frame can
 be grabbed.
-

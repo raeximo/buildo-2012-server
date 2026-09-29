@@ -17,15 +17,22 @@
  *    1 call function    9 inventory      14 objects     16 item database
  */
 #include <enet/enet.h>
+#ifdef __APPLE__
 #include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <cerrno>
+#include <csignal>
 #include <string>
 #include <vector>
 #include <map>
+#include <sys/stat.h>
 
 /* ---------- Proton NetMessage ids ---------- */
 enum {
@@ -402,6 +409,7 @@ struct TileExtra {
 
 struct Tile {
     uint16_t  fg = 0, bg = 0;
+    uint16_t  flags = 0;        // bit 0x20 mirrors directional tile artwork
     TileExtra extra;
     uint8_t   damage = 0;       // punches taken, mirrors client Tile+0x28
     time_t    healAt = 0;
@@ -455,6 +463,161 @@ struct WorldData {
 };
 
 static std::map<std::string, WorldData> g_worlds;
+static volatile sig_atomic_t g_stop = 0;
+
+static void request_stop(int) { g_stop = 1; }
+
+/* ---------- World persistence ----------
+   This is deliberately a server-owned format, separate from the client world
+   blob. Files are replaced atomically so an interrupted write keeps the last
+   good copy. World names are hex-encoded, so names such as ../foo can never
+   escape the save directory. */
+static std::string world_dir() {
+    const char* p = getenv("BUILDO_WORLD_DIR");
+    return (p && *p) ? p : "worlds";
+}
+
+static std::string world_path(const std::string& name) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out = world_dir() + "/";
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        out += hex[c >> 4]; out += hex[c & 15];
+    }
+    return out + ".bworld";
+}
+
+static bool ensure_world_dir() {
+    std::string dir = world_dir();
+    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST) return true;
+    fprintf(stderr, "[gs] cannot create world directory '%s': %s\n",
+            dir.c_str(), strerror(errno));
+    return false;
+}
+
+static void file_u8(FILE* f, uint8_t v) { fwrite(&v, 1, 1, f); }
+static void file_u16(FILE* f, uint16_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_u32(FILE* f, uint32_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_i64(FILE* f, int64_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_float(FILE* f, float v) { fwrite(&v, sizeof v, 1, f); }
+static void file_string(FILE* f, const std::string& s) {
+    file_u32(f, (uint32_t)s.size());
+    if (!s.empty()) fwrite(s.data(), 1, s.size(), f);
+}
+
+static bool save_world(const WorldData& w) {
+    if (!ensure_world_dir()) return false;
+    std::string path = world_path(w.name), tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "[gs] cannot open world save '%s': %s\n",
+                tmp.c_str(), strerror(errno));
+        return false;
+    }
+    fwrite("BLDWORLD", 1, 8, f); file_u32(f, 2);
+    file_string(f, w.name); file_u32(f, (uint32_t)w.w); file_u32(f, (uint32_t)w.h);
+    file_u32(f, (uint32_t)w.spawnX); file_u32(f, (uint32_t)w.spawnY);
+    file_u32(f, (uint32_t)w.tiles.size());
+    for (size_t i = 0; i < w.tiles.size(); ++i) {
+        const Tile& t = w.tiles[i];
+        file_u16(f, t.fg); file_u16(f, t.bg); file_u16(f, t.flags);
+        file_u8(f, t.damage);
+        file_i64(f, (int64_t)t.healAt); file_i64(f, (int64_t)t.plantedAt);
+        file_u8(f, t.extra.type); file_string(f, t.extra.s1);
+        file_string(f, t.extra.s2); file_string(f, t.extra.s3);
+        file_u8(f, t.extra.b1); file_u32(f, t.extra.u1);
+        file_u32(f, t.extra.age); file_u8(f, t.extra.stage);
+        file_u32(f, (uint32_t)t.extra.list.size());
+        for (size_t k = 0; k < t.extra.list.size(); ++k) file_u32(f, t.extra.list[k]);
+    }
+    file_u32(f, w.nextObjectId); file_u32(f, (uint32_t)w.objects.size());
+    for (size_t i = 0; i < w.objects.size(); ++i) {
+        const WorldObject& o = w.objects[i];
+        file_u32(f, o.id); file_u16(f, o.itemId); file_float(f, o.x); file_float(f, o.y);
+        file_u8(f, o.count); file_u8(f, o.flags);
+    }
+    file_u32(f, (uint32_t)w.locks.size());
+    for (size_t i = 0; i < w.locks.size(); ++i) {
+        const WorldLock& l = w.locks[i];
+        file_u32(f, (uint32_t)l.x); file_u32(f, (uint32_t)l.y);
+        file_u32(f, (uint32_t)l.owner); file_u32(f, (uint32_t)l.tiles.size());
+        for (size_t k = 0; k < l.tiles.size(); ++k) file_u16(f, l.tiles[k]);
+    }
+    bool ok = !ferror(f) && fflush(f) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) { fprintf(stderr, "[gs] failed saving world '%s': %s\n", w.name.c_str(), strerror(errno)); remove(tmp.c_str()); }
+    return ok;
+}
+
+static bool read_exact(FILE* f, void* p, size_t n) { return fread(p, 1, n, f) == n; }
+static bool read_u8(FILE* f, uint8_t& v) { return read_exact(f, &v, 1); }
+static bool read_u16(FILE* f, uint16_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_u32(FILE* f, uint32_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_i64(FILE* f, int64_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_float(FILE* f, float& v) { return read_exact(f, &v, sizeof v); }
+static bool read_string(FILE* f, std::string& s, uint32_t limit = 65536) {
+    uint32_t n; if (!read_u32(f, n) || n > limit) return false;
+    s.resize(n); return n == 0 || read_exact(f, &s[0], n);
+}
+
+static bool load_world(const std::string& requested, WorldData& w) {
+    std::string path = world_path(requested);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8]; uint32_t version, width, height, count, u; int64_t stamp;
+    bool ok = read_exact(f, magic, 8) && memcmp(magic, "BLDWORLD", 8) == 0 &&
+              read_u32(f, version) && (version == 1 || version == 2) &&
+              read_string(f, w.name, 1024) &&
+              w.name == requested && read_u32(f, width) && read_u32(f, height) &&
+              width > 0 && height > 0 && width <= 1000 && height <= 1000;
+    if (ok) { w.w = (int)width; w.h = (int)height; ok = read_u32(f, u); w.spawnX = (int)u; }
+    if (ok) { ok = read_u32(f, u); w.spawnY = (int)u; }
+    if (ok) ok = read_u32(f, count) && count == width * height && count <= 1000000;
+    if (ok) w.tiles.resize(count);
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        Tile& t = w.tiles[i]; uint32_t listCount; stamp = 0;
+        ok = read_u16(f, t.fg) && read_u16(f, t.bg);
+        if (ok && version >= 2) ok = read_u16(f, t.flags);
+        if (ok) ok = read_u8(f, t.damage) && read_i64(f, stamp);
+        t.healAt = (time_t)stamp;
+        if (ok) { ok = read_i64(f, stamp); t.plantedAt = (time_t)stamp; }
+        if (ok) ok = read_u8(f, t.extra.type) && read_string(f, t.extra.s1) &&
+                     read_string(f, t.extra.s2) && read_string(f, t.extra.s3) &&
+                     read_u8(f, t.extra.b1) && read_u32(f, t.extra.u1) &&
+                     read_u32(f, t.extra.age) && read_u8(f, t.extra.stage) &&
+                     read_u32(f, listCount) && listCount <= 100000;
+        if (ok) t.extra.list.resize(listCount);
+        for (uint32_t k = 0; ok && k < listCount; ++k) ok = read_u32(f, t.extra.list[k]);
+    }
+    uint32_t objectCount = 0, lockCount = 0;
+    if (ok) ok = read_u32(f, w.nextObjectId) && read_u32(f, objectCount) && objectCount <= 100000;
+    if (ok) w.objects.resize(objectCount);
+    for (uint32_t i = 0; ok && i < objectCount; ++i) {
+        WorldObject& o = w.objects[i];
+        ok = read_u32(f, o.id) && read_u16(f, o.itemId) && read_float(f, o.x) &&
+             read_float(f, o.y) && read_u8(f, o.count) && read_u8(f, o.flags);
+    }
+    if (ok) ok = read_u32(f, lockCount) && lockCount <= 100000;
+    if (ok) w.locks.resize(lockCount);
+    for (uint32_t i = 0; ok && i < lockCount; ++i) {
+        WorldLock& l = w.locks[i]; uint32_t tileCount;
+        ok = read_u32(f, u); l.x = (int)u;
+        if (ok) { ok = read_u32(f, u); l.y = (int)u; }
+        if (ok) { ok = read_u32(f, u); l.owner = (int)u; }
+        if (ok) ok = read_u32(f, tileCount) && tileCount <= count;
+        if (ok) l.tiles.resize(tileCount);
+        for (uint32_t k = 0; ok && k < tileCount; ++k) ok = read_u16(f, l.tiles[k]);
+    }
+    fclose(f);
+    if (!ok) fprintf(stderr, "[gs] ignored invalid world save '%s'\n", path.c_str());
+    return ok;
+}
+
+static void save_all_worlds() {
+    for (std::map<std::string, WorldData>::const_iterator it = g_worlds.begin();
+         it != g_worlds.end(); ++it) save_world(it->second);
+}
 
 static const int WORLD_W = 100, WORLD_H = 60;
 static const int GROUND  = 30;           // first solid row
@@ -473,6 +636,12 @@ enum { IT_BLANK = 0, IT_DIRT = 2, IT_DOOR = 6, IT_BEDROCK = 8, IT_ROCK = 10,
 static WorldData& get_world(const std::string& name) {
     auto it = g_worlds.find(name);
     if (it != g_worlds.end()) return it->second;
+
+    WorldData saved;
+    if (load_world(name, saved)) {
+        printf("[gs] loaded world '%s' %dx%d from disk\n", name.c_str(), saved.w, saved.h);
+        return g_worlds.emplace(name, std::move(saved)).first->second;
+    }
 
     WorldData w;
     w.name = name;
@@ -542,7 +711,9 @@ static WorldData& get_world(const std::string& name) {
 
     printf("[gs] generated world '%s' %dx%d, spawn %d,%d\n",
            name.c_str(), w.w, w.h, w.spawnX, w.spawnY);
-    return g_worlds.emplace(name, std::move(w)).first->second;
+    WorldData& created = g_worlds.emplace(name, std::move(w)).first->second;
+    save_world(created);
+    return created;
 }
 
 /* TileExtra::Serialize 0x43f070: uint8 type, then by type
@@ -606,13 +777,12 @@ static std::vector<uint8_t> serialize_world(WorldData& w) {
     for (int y = 0; y < w.h; ++y) {
         for (int x = 0; x < w.w; ++x) {
             Tile& t = w.at(x, y);
-            /* Keep flags at 0: the client sets bit 0 itself for the materials
-               that need an extra, and setting it here for one that does not
-               would make it read an extra we never wrote. */
+            /* Only persist the artwork-mirror bit. The client sets bit 0
+               itself for materials that need a TileExtra. */
             w16(b, t.fg);
             w16(b, t.bg);
             w16(b, 0);
-            w16(b, 0);
+            w16(b, (uint16_t)(t.flags & 0x20));
             const ItemDef* d = def(t.fg);
             int want = d ? extra_type_for_material(d->material) : 0;
             if (want && !getenv("BUILDO_NO_EXTRA")) {
@@ -836,6 +1006,73 @@ static void refresh_clothing(Player& pl) {
     }
 }
 
+/* Cosmetics are account state rather than world state. The prototype has no
+   authentication, so the requested player name is the stable profile key. */
+static std::string player_dir() {
+    const char* p = getenv("BUILDO_PLAYER_DIR");
+    return (p && *p) ? p : "players";
+}
+
+static std::string player_path(const std::string& name) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out = player_dir() + "/";
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        out += hex[c >> 4]; out += hex[c & 15];
+    }
+    return out + ".bplayer";
+}
+
+static bool save_player(const Player& pl) {
+    if (pl.name.empty()) return false;
+    std::string dir = player_dir();
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    std::string path = player_path(pl.name), tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    fwrite("BLDPLAYER", 1, 9, f); file_u32(f, 1); file_string(f, pl.name);
+    file_u32(f, pl.skin);
+    for (size_t i = 0; i < 6; ++i) file_u16(f, pl.cloth[i]);
+    bool ok = !ferror(f) && fflush(f) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) remove(tmp.c_str());
+    return ok;
+}
+
+static bool load_player(Player& pl) {
+    FILE* f = fopen(player_path(pl.name).c_str(), "rb");
+    if (!f) return false;
+    char magic[9]; uint32_t version, skin; std::string savedName;
+    uint16_t clothes[6] = {};
+    bool ok = read_exact(f, magic, 9) && memcmp(magic, "BLDPLAYER", 9) == 0 &&
+              read_u32(f, version) && version == 1 &&
+              read_string(f, savedName, 1024) && savedName == pl.name &&
+              read_u32(f, skin);
+    for (size_t i = 0; ok && i < 6; ++i) ok = read_u16(f, clothes[i]);
+    fclose(f);
+    if (!ok) return false;
+
+    pl.skin = skin;
+    for (size_t i = 0; i < pl.inv.size(); ++i) pl.inv[i].flags &= (uint8_t)~1;
+    for (size_t part = 0; part < 6; ++part) {
+        uint16_t id = clothes[part];
+        const ItemDef* d = def(id);
+        if (!id || !d || d->material != MAT_CLOTHES || d->bodyPart != part) continue;
+        if (!inv_has(pl, id)) inv_add(pl, id, 1);
+        for (size_t i = 0; i < pl.inv.size(); ++i)
+            if (pl.inv[i].id == id) pl.inv[i].flags |= 1;
+    }
+    refresh_clothing(pl);
+    printf("[gs] loaded cosmetics for '%s'\n", pl.name.c_str());
+    return true;
+}
+
+static void save_all_players() {
+    for (std::map<ENetPeer*, Player>::const_iterator it = g_players.begin();
+         it != g_players.end(); ++it) save_player(it->second);
+}
+
 /* OnSetClothing(vec3 slots 0-2, vec3 slots 3-5, uint32 skin colour).
    The handler at 0x448ad0 reads both vec3s field by field, rounds each to a
    uint16 and writes six slots; the third argument goes to 0x449ff0 as the
@@ -881,13 +1118,14 @@ static void console(ENetPeer* p, const std::string& msg) {
  * not a NetObject it knows (0x433b7d).
  */
 static void send_set_tile(const std::string& world, int x, int y, int itemId,
-                          int actorNetID) {
+                          int actorNetID, bool flipped = false) {
     GameUpdatePacket g{};
     g.packetType = 3;
     g.netID      = actorNetID;
     g.intData    = itemId;
     g.intX       = x;
     g.intY       = y;
+    if (flipped) g.flags |= 0x10; /* ApplyPacket turns this into tile flag 0x20 */
     broadcast_gup(world, g);
 }
 
@@ -1135,7 +1373,7 @@ static void send_tile_update(const std::string& world, int x, int y, Tile& t) {
     w16(b, t.fg);
     w16(b, t.bg);
     w16(b, 0);
-    w16(b, 0);
+    w16(b, (uint16_t)(t.flags & 0x20));
     const ItemDef* d = def(t.fg);
     int want = d ? extra_type_for_material(d->material) : 0;
     if (want) {
@@ -1276,7 +1514,8 @@ static void harvest_tree(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
                          uint16_t seedId) {
     play_at(w.name, pl.netID, "audio/tree_harvest.wav");
     Tile& t = w.at(x, y);
-    t.fg = 0; t.extra = TileExtra(); t.damage = 0; t.healAt = 0; t.plantedAt = 0;
+    t.fg = 0; t.flags = 0; t.extra = TileExtra();
+    t.damage = 0; t.healAt = 0; t.plantedAt = 0;
     send_set_tile(w.name, x, y, IT_FIST, pl.netID);
     /* Seeds sit at blockId + 1 in item_definitions.txt and the client proves
        the pairing by hanging that very block on the ripe tree as fruit, so the
@@ -1331,8 +1570,8 @@ static void handle_punch(ENetPeer* peer, Player& pl, WorldData& w, int x, int y)
 
     /* broken: clear the same layer the client will clear, and hand it over */
     t.damage = 0; t.healAt = 0;
-    if (t.fg) { t.fg = 0; t.extra = TileExtra(); }
-    else      { t.bg = 0; }
+    if (t.fg) { t.fg = 0; t.flags = 0; t.extra = TileExtra(); }
+    else      { t.bg = 0; t.flags = 0; }
     send_set_tile(w.name, x, y, IT_FIST, pl.netID);
     play_at(w.name, pl.netID, "audio/tile_removed.wav");
     /* The block does not teleport into your pockets any more: it lands in the
@@ -1353,7 +1592,7 @@ static void place_refused(int x, int y, const char* why, const ItemDef* d) {
 }
 
 static void handle_place(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
-                         int itemId) {
+                         int itemId, bool flipped) {
     const ItemDef* d = def(itemId);
     if (!d) { printf("  -- place refused: no such item %d\n", itemId); return; }
     Tile& t = w.at(x, y);
@@ -1398,13 +1637,14 @@ static void handle_place(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
             if (want == 3) t.extra.u1 = (uint32_t)pl.netID;   // lock owner
         }
     }
+    t.flags = flipped ? 0x20 : 0;
     t.damage = 0; t.healAt = 0;
 
     /* The client deducts one from its own inventory when it sees this packet
        with itself as the actor (0x433ca6 -> 0x43d800), so the server makes
        the same deduction and does not resend the inventory. */
     inv_take(pl, (uint16_t)itemId, 1);
-    send_set_tile(w.name, x, y, itemId, pl.netID);
+    send_set_tile(w.name, x, y, itemId, pl.netID, flipped);
     send_take_item(w.name, itemId, 1);
     /* A lock claims the ground around it the moment it goes down. */
     if (d->material == MAT_LOCK) {
@@ -1573,6 +1813,7 @@ static void handle_wear(ENetPeer* peer, Player& pl, int itemId) {
         }
     }
     refresh_clothing(pl);
+    save_player(pl);
     send_inventory(peer, pl);
     send_clothing(peer, pl);
     for (std::map<ENetPeer*, Player>::iterator it = g_players.begin();
@@ -1663,6 +1904,8 @@ static void join_world(ENetPeer* peer, Player& pl, const std::string& wname) {
 
 /* ==================================================================== */
 int main() {
+    signal(SIGINT, request_stop);
+    signal(SIGTERM, request_stop);
     g_verbose = getenv("BUILDO_VERBOSE") != NULL;
 
     if (enet_initialize() != 0) { fprintf(stderr,"enet init failed\n"); return 1; }
@@ -1687,8 +1930,15 @@ int main() {
     if (const char* e = getenv("BUILDO_ITEMS")) itemsPath = e;
     else {
         char buf[4096];
+        bool haveExe = false;
+#ifdef __APPLE__
         uint32_t sz = sizeof buf;
-        if (_NSGetExecutablePath(buf, &sz) == 0) {
+        haveExe = (_NSGetExecutablePath(buf, &sz) == 0);
+#elif defined(__linux__)
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n >= 0) { buf[n] = '\0'; haveExe = true; }
+#endif
+        if (haveExe) {
             std::string exe(buf);
             size_t slash = exe.find_last_of('/');
             if (slash != std::string::npos) itemsPath = exe.substr(0, slash) + "/items.dat";
@@ -1709,11 +1959,12 @@ int main() {
 
     int nextNetID = 1;
     ENetEvent ev;
-    time_t lastGrow = 0;
-    while (true) {
+    time_t lastGrow = 0, lastSave = 0;
+    while (!g_stop) {
         time_t nowTick = time(NULL);
         if (nowTick != lastGrow) { lastGrow = nowTick; grow_plants(); }
-        while (enet_host_service(host, &ev, 200) > 0) {
+        if (nowTick - lastSave >= 5) { lastSave = nowTick; save_all_worlds(); }
+        while (!g_stop && enet_host_service(host, &ev, 200) > 0) {
             switch (ev.type) {
 
             case ENET_EVENT_TYPE_CONNECT: {
@@ -1753,6 +2004,8 @@ int main() {
                         pl.name = get_field(txt, "requestedName");
                         if (pl.name.empty()) pl.name = "Player";
                         give_starter_kit(pl);
+                        refresh_clothing(pl);
+                        load_player(pl);
                         printf("\n[gs] LOGIN '%s' (netID %d), items hash %d -> client\n",
                                pl.name.c_str(), pl.netID, (int32_t)g_itemHash);
                         console(ev.peer, "`2Local Buildo server`` connected.");
@@ -1827,6 +2080,7 @@ int main() {
                         std::string c = get_field(txt, "color");
                         if (!c.empty()) {
                             pl.skin = (uint32_t)strtoul(c.c_str(), NULL, 10);
+                            save_player(pl);
                             printf("  ** %s skin 0x%08x\n", pl.name.c_str(), pl.skin);
                             if (pl.inWorld) {
                                 send_clothing(ev.peer, pl);
@@ -1968,7 +2222,8 @@ int main() {
                         else if (held->material == MAT_WRENCH)
                             handle_wrench(ev.peer, pl, w, x, y);
                         else
-                            handle_place(ev.peer, pl, w, x, y, g->intData);
+                            handle_place(ev.peer, pl, w, x, y, g->intData,
+                                         (g->flags & 0x10) != 0);
                         fflush(stdout);
                         enet_packet_destroy(ev.packet);
                         break;
@@ -1994,6 +2249,7 @@ int main() {
             case ENET_EVENT_TYPE_DISCONNECT: {
                 Player& pl = g_players[ev.peer];
                 printf("\n[gs] DISCONNECT %s\n", pl.name.c_str());
+                save_player(pl);
                 leave_world(ev.peer, pl);
                 g_players.erase(ev.peer);
                 fflush(stdout);
@@ -2003,4 +2259,10 @@ int main() {
             }
         }
     }
+    printf("[gs] saving worlds before shutdown\n");
+    save_all_worlds();
+    save_all_players();
+    enet_host_destroy(host);
+    enet_deinitialize();
+    return 0;
 }

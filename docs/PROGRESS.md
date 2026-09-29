@@ -360,7 +360,7 @@ is the only channel that can reach them: `tile_removed` on a break,
 
 Verified by screenshot and by reading the client's own memory:
 
-* the world loads, renders and persists **in the server process**
+* the world loads, renders and persists to disk across server restarts
 * dirt / bedrock / cave wall use smart-edge sprites — grass on top, corners,
   edges around holes
 * doors, signs, locks (with their area outline) and planted seeds all load,
@@ -382,8 +382,7 @@ Verified by screenshot and by reading the client's own memory:
   ripe one harvests it
 * lava kills you and respawns you
 
-Not implemented: **world persistence to disk** (worlds live in the server
-process and die with it), the SHOP/STORE buttons.
+Not implemented: the SHOP/STORE buttons.
 
 Open work with the evidence already gathered is in
 [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).

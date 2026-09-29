@@ -11,12 +11,6 @@ labelled*, never *plausible*.
 
 ## Server work, no reverse engineering needed
 
-**World persistence to disk.** Worlds currently live in the `gs` process and
-die with it. The blob format is fully documented in
-[PROTOCOL.md](PROTOCOL.md#world) and the server already serialises it to send;
-writing it to a file and reading it back is ordinary work. Biggest single
-missing feature.
-
 **More than one player at a time.** The netID plumbing, `OnSpawn`/`OnRemove`
 and the per-player inventory are all there; nobody has sat two clients in one
 world and watched what breaks.

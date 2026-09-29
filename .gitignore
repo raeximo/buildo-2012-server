@@ -12,12 +12,14 @@ __pycache__/
 items.dat
 tools/items_*.dat
 cache/
+run/
 
 # --- run logs and scratch ---
 *.log
 exit.txt
 response.txt
 worlds/
+players/
 shot*.png
 *.req
 
